@@ -2,34 +2,32 @@ name: Testomat automated test change alert
 
 on:
   schedule:
-    - cron: "* * * * *"   # КОЖНУ 1 ХВИЛИНУ
+    - cron: "* * * * *"   # кожну 1 хв
   workflow_dispatch:
 
 jobs:
   check:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      # Відновлюємо збережений state між запусками
       - name: Restore state cache
         uses: actions/cache@v4
         with:
           path: data/state.json
           key: testomat-alert-state-v1
 
-      - name: Run Testomat checker
+      - name: Run checker
         env:
           TESTOMAT_TOKEN: ${{ secrets.TESTOMAT_TOKEN }}
+          TESTOMAT_PROJECT_ID: ${{ secrets.TESTOMAT_PROJECT_ID }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: bash scripts/check_testomat.sh
 
-      # Зберігаємо state назад у cache
       - name: Save state cache
         uses: actions/cache@v4
         with:
