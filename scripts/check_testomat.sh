@@ -7,26 +7,14 @@ TOKEN="${TESTOMAT_TOKEN:-}"
 SLACK="${SLACK_WEBHOOK_URL:-}"
 
 STATE_FILE="data/state.json"
-COOLDOWN_SECONDS=600   # 10 хв антиспам на один тест
+COOLDOWN_SECONDS=600  # 10 хв антиспам на один тест
 
-if [[ -z "$PROJECT_ID" ]]; then
-  echo "ERROR: TESTOMAT_PROJECT_ID is empty (GitHub secret)."
-  exit 2
-fi
-if [[ -z "$TOKEN" ]]; then
-  echo "ERROR: TESTOMAT_TOKEN is empty (GitHub secret)."
-  exit 2
-fi
-if [[ -z "$SLACK" ]]; then
-  echo "ERROR: SLACK_WEBHOOK_URL is empty (GitHub secret)."
-  exit 2
-fi
+if [[ -z "$PROJECT_ID" ]]; then echo "ERROR: TESTOMAT_PROJECT_ID empty"; exit 2; fi
+if [[ -z "$TOKEN" ]]; then echo "ERROR: TESTOMAT_TOKEN empty"; exit 2; fi
+if [[ -z "$SLACK" ]]; then echo "ERROR: SLACK_WEBHOOK_URL empty"; exit 2; fi
 
 mkdir -p data
-if [ ! -f "$STATE_FILE" ]; then
-  echo "{}" > "$STATE_FILE"
-fi
-
+if [[ ! -f "$STATE_FILE" ]]; then echo "{}" > "$STATE_FILE"; fi
 now=$(date +%s)
 
 api_get() {
@@ -37,64 +25,182 @@ api_get() {
     "$url"
 }
 
-# IMPORTANT:
-# Далі ми маємо взяти список automated тестів.
-# У вашому API приклад для analytics є /api/{project_id}/analytics/tags
-# Для тестів endpoint може бути інший (tests, cases, etc).
-# Нижче я поставив найтиповіший варіант: /api/{project_id}/tests?state=automated
-LIST_URL="$BASE/api/$PROJECT_ID/tests?state=automated"
+http_status() { echo "$1" | sed -n 's/__HTTP_STATUS__:\([0-9]\{3\}\)/\1/p'; }
+http_body()   { echo "$1" | sed '/__HTTP_STATUS__:/,$d'; }
 
-resp=$(api_get "$LIST_URL")
-status=$(echo "$resp" | sed -n 's/__HTTP_STATUS__:\([0-9]\{3\}\)/\1/p')
-body=$(echo "$resp" | sed '/__HTTP_STATUS__:/,$d')
+# --------- 0) Sanity check: token+project should work (testruns) ----------
+SANITY_URL="$BASE/api/$PROJECT_ID/testruns"
+sresp=$(api_get "$SANITY_URL")
+sstatus=$(http_status "$sresp")
+if [[ "$sstatus" != "200" ]]; then
+  echo "ERROR: Sanity check failed: $SANITY_URL returned HTTP $sstatus"
+  echo "Body:"
+  echo "$(http_body "$sresp")" | head -c 500; echo
+  exit 5
+fi
+echo "Sanity OK: /testruns доступний (HTTP 200)"
 
-echo "Testomat list status: $status"
-echo "List URL: $LIST_URL"
-echo "Body (first 300 chars):"
-echo "$body" | head -c 300
-echo
+# --------- 1) Find tests list endpoint automatically ----------
+# Ми пробуємо кілька найбільш типових шляхів.
+# Якщо у вас доступ до suites/tests обмежений, буде видно по статусах.
+CANDIDATES=(
+  "$BASE/api/$PROJECT_ID/tests?state=automated"
+  "$BASE/api/$PROJECT_ID/tests"
+  "$BASE/api/$PROJECT_ID/testcases?state=automated"
+  "$BASE/api/$PROJECT_ID/testcases"
+  "$BASE/api/$PROJECT_ID/cases?state=automated"
+  "$BASE/api/$PROJECT_ID/cases"
+  "$BASE/api/$PROJECT_ID/suites"  # fallback: якщо є тільки suites дерево
+)
 
-if [[ "$status" != "200" ]]; then
-  echo "ERROR: List request failed with HTTP $status"
+LIST_URL=""
+LIST_MODE=""  # "direct" або "suites"
+
+echo "Trying endpoints for tests list..."
+for u in "${CANDIDATES[@]}"; do
+  r=$(api_get "$u")
+  st=$(http_status "$r")
+  echo " - $st $u"
+  if [[ "$st" == "200" ]]; then
+    LIST_URL="$u"
+    if [[ "$u" == *"/suites" ]]; then
+      LIST_MODE="suites"
+    else
+      LIST_MODE="direct"
+    fi
+    break
+  fi
+done
+
+if [[ -z "$LIST_URL" ]]; then
+  echo "ERROR: Could not find a working tests/suites endpoint."
+  echo "Token+project works for /testruns, but tests management endpoints are returning non-200."
+  echo "Possible causes: insufficient permissions (role), different endpoint naming, or project key mismatch."
   exit 5
 fi
 
-# Підтримка двох форматів: [] або {data:[]}
-items=$(echo "$body" | jq -c '
-  if type=="array" then .[]
-  elif (has("data") and (.data|type=="array")) then .data[]
-  else empty end
-')
+echo "Selected list endpoint: $LIST_URL (mode=$LIST_MODE)"
 
-if [[ -z "$items" ]]; then
-  echo "ERROR: No items found in list response or unexpected JSON."
+# --------- Helpers to parse list shapes ----------
+# Підтримуємо формати:
+#   - [ {...}, {...} ]
+#   - { data: [ {...} ] }
+# Для direct list: очікуємо, що елементи мають хоча б id/title/state.
+parse_list_items_to_ndjson() {
+  jq -c '
+    if type=="array" then .[]
+    elif (has("data") and (.data|type=="array")) then .data[]
+    else empty end
+  '
+}
+
+extract_test_min_fields() {
+  jq -c '
+    {
+      id: ((.id // ._id // "")|tostring),
+      title: (.title // .name // ""),
+      state: (.state // "")
+    }
+  '
+}
+
+# --------- 2) Collect tests (direct or suites traversal) ----------
+tests_file="data/tests.ndjson"
+: > "$tests_file"
+
+if [[ "$LIST_MODE" == "direct" ]]; then
+  lresp=$(api_get "$LIST_URL")
+  lbody=$(http_body "$lresp")
+
+  echo "$lbody" | parse_list_items_to_ndjson | extract_test_min_fields >> "$tests_file"
+else
+  # suites traversal (BFS) because tests might be nested
+  root_resp=$(api_get "$LIST_URL")
+  root_body=$(http_body "$root_resp")
+
+  queue="data/suite_queue.txt"
+  seen="data/suite_seen.txt"
+  : > "$queue"; : > "$seen"
+
+  # root suites ids
+  echo "$root_body" | parse_list_items_to_ndjson | jq -r '.id // ._id // empty' >> "$queue"
+
+  while read -r sid; do
+    [[ -z "$sid" ]] && continue
+    if grep -qx "$sid" "$seen" 2>/dev/null; then
+      continue
+    fi
+    echo "$sid" >> "$seen"
+
+    SUITE_URL="$BASE/api/$PROJECT_ID/suites/$sid"
+    sresp=$(api_get "$SUITE_URL")
+    sst=$(http_status "$sresp")
+    sbody=$(http_body "$sresp")
+
+    if [[ "$sst" != "200" ]]; then
+      echo "WARN: suite $sid failed HTTP $sst"
+      continue
+    fi
+
+    # child suites ids (several possible field names)
+    echo "$sbody" | jq -r '
+      ( .suites? // .children? // .child_suites? // [] )
+      | (if type=="array" then .[]?.id else empty end)
+    ' | sed '/^$/d' >> "$queue"
+
+    # tests items in suite (several possible field names)
+    echo "$sbody" | jq -c '
+      ( .tests? // .items? // .cases? // [] )
+      | (if type=="array" then .[] else empty end)
+    ' | extract_test_min_fields >> "$tests_file"
+  done < "$queue"
+fi
+
+if [[ ! -s "$tests_file" ]]; then
+  echo "ERROR: No tests collected."
   exit 5
 fi
 
-echo "$items" | while read -r test; do
-  id=$(echo "$test" | jq -r '.id // empty')
-  title=$(echo "$test" | jq -r '.title // .name // ("Test " + ((.id // "unknown")|tostring))')
-  [[ -z "$id" ]] && continue
+# --------- 3) For each automated test: fetch details, hash steps, alert on change ----------
+# Деталі тесту теж можуть бути в різних endpoint-ах — теж пробуємо кілька.
+DETAILS_CANDIDATES=(
+  "$BASE/api/$PROJECT_ID/tests/%s"
+  "$BASE/api/$PROJECT_ID/testcases/%s"
+  "$BASE/api/$PROJECT_ID/cases/%s"
+)
 
-  # Деталі тесту (типово /tests/{id})
-  DETAILS_URL="$BASE/api/$PROJECT_ID/tests/$id"
-  dresp=$(api_get "$DETAILS_URL")
-  dstatus=$(echo "$dresp" | sed -n 's/__HTTP_STATUS__:\([0-9]\{3\}\)/\1/p')
-  dbody=$(echo "$dresp" | sed '/__HTTP_STATUS__:/,$d')
+get_details_body() {
+  local id="$1"
+  for fmt in "${DETAILS_CANDIDATES[@]}"; do
+    url=$(printf "$fmt" "$id")
+    dresp=$(api_get "$url")
+    dst=$(http_status "$dresp")
+    if [[ "$dst" == "200" ]]; then
+      echo "$(http_body "$dresp")"
+      return 0
+    fi
+  done
+  return 1
+}
 
-  if [[ "$dstatus" != "200" ]]; then
-    echo "WARN: details HTTP $dstatus for id=$id"
+# only state=automated
+cat "$tests_file" | jq -c 'select(.state=="automated" and .id!="")' | while read -r t; do
+  id=$(echo "$t" | jq -r '.id')
+  title=$(echo "$t" | jq -r '.title // ("Test " + .id)')
+
+  if ! details=$(get_details_body "$id"); then
+    echo "WARN: could not fetch details for test id=$id (tried tests/testcases/cases)"
     continue
   fi
 
-  steps=$(echo "$dbody" | jq -r '.code // .description // ""')
+  steps=$(echo "$details" | jq -r '.code // .description // ""')
   hash=$(printf "%s" "$steps" | sha256sum | awk '{print $1}')
 
   old_hash=$(jq -r --arg id "$id" '.[$id].hash // empty' "$STATE_FILE")
   last_alert=$(jq -r --arg id "$id" '.[$id].last_alert_ts // 0' "$STATE_FILE")
   [[ "$last_alert" == "null" || -z "$last_alert" ]] && last_alert=0
 
-  # перший раз — тільки запамʼятати
+  # baseline: перший раз без алерта
   if [[ -z "$old_hash" ]]; then
     jq --arg id "$id" --arg hash "$hash" '.[$id]={hash:$hash,last_alert_ts:0}' \
       "$STATE_FILE" > data/tmp.json && mv data/tmp.json "$STATE_FILE"
@@ -102,7 +208,6 @@ echo "$items" | while read -r test; do
   fi
 
   if [[ "$old_hash" != "$hash" ]]; then
-    # cooldown
     if (( now - last_alert >= COOLDOWN_SECONDS )); then
       payload=$(jq -n \
         --arg title "$title" \
@@ -124,9 +229,7 @@ echo "$items" | while read -r test; do
         '.[$id]={hash:$hash,last_alert_ts:$ts}' \
         "$STATE_FILE" > data/tmp.json && mv data/tmp.json "$STATE_FILE"
     else
-      # hash оновили, алерт не шлемо
-      jq --arg id "$id" --arg hash "$hash" \
-        '.[$id].hash=$hash' \
+      jq --arg id "$id" --arg hash "$hash" '.[$id].hash=$hash' \
         "$STATE_FILE" > data/tmp.json && mv data/tmp.json "$STATE_FILE"
     fi
   fi
