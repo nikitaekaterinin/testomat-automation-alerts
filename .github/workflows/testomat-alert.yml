@@ -26,7 +26,7 @@ jobs:
       - name: Run Testomat checker
         env:
           TESTOMAT_TOKEN: ${{ secrets.TESTOMAT_TOKEN }}
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: bash scripts/check_testomat.sh
 
       # Зберігаємо state назад у cache
