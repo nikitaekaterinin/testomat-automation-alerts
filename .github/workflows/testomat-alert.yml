@@ -27,7 +27,6 @@ jobs:
         env:
           TESTOMAT_TOKEN: ${{ secrets.TESTOMAT_TOKEN }}
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-          TESTOMAT_BASE_URL: ${{ secrets.TESTOMAT_BASE_URL }}
         run: bash scripts/check_testomat.sh
 
       # Зберігаємо state назад у cache
